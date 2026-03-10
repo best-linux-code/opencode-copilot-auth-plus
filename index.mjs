@@ -62,7 +62,7 @@ export async function CopilotAuthPlugin() {
         Authorization: `Bearer ${info.refresh}`,
         "Copilot-Integration-Id": "copilot-developer-cli",
         "Openai-Intent": "model-access",
-        "User-Agent": "opencode-copilot-cli-auth/0.0.14",
+        "User-Agent": "opencode-copilot-cli-auth/0.0.15",
         "X-GitHub-Api-Version": API_VERSION,
         "X-Interaction-Type": "model-access",
         "X-Request-Id": crypto.randomUUID(),
@@ -125,14 +125,6 @@ export async function CopilotAuthPlugin() {
         model.capabilities.input.image = true;
       }
 
-      if (model.api?.npm === "@ai-sdk/github-copilot" && model.id.includes("claude")) {
-        model.variants = {
-          low: { thinking_budget: 1024 },
-          medium: { thinking_budget: 4000 },
-          high: { thinking_budget: Math.min(16000, Math.floor(model.limit.output / 2 - 1)) },
-          max: { thinking_budget: Math.min(31999, model.limit.output - 1) },
-        };
-      }
     }
   }
 
@@ -182,7 +174,7 @@ export async function CopilotAuthPlugin() {
       Authorization: `Bearer ${info.refresh}`,
       "Copilot-Integration-Id": "copilot-developer-cli",
       "Openai-Intent": "conversation-agent",
-      "User-Agent": "opencode-copilot-cli-auth/0.0.14",
+      "User-Agent": "opencode-copilot-cli-auth/0.0.15",
       "X-GitHub-Api-Version": API_VERSION,
       "X-Initiator": isAgent ? "agent" : "user",
       "X-Interaction-Id": crypto.randomUUID(),
@@ -198,6 +190,11 @@ export async function CopilotAuthPlugin() {
     delete headers["authorization"];
 
     return headers;
+  }
+
+  function resolveClaudeThinkingBudget(model, variant) {
+    if (!model?.id?.includes("claude")) return undefined;
+    return variant === "thinking" ? 16000 : undefined;
   }
 
   return {
@@ -303,7 +300,7 @@ export async function CopilotAuthPlugin() {
               headers: {
                 Accept: "application/json",
                 "Content-Type": "application/json",
-                "User-Agent": "opencode-copilot-cli-auth/0.0.14",
+                "User-Agent": "opencode-copilot-cli-auth/0.0.15",
               },
               body: JSON.stringify({
                 client_id: CLIENT_ID,
@@ -328,7 +325,7 @@ export async function CopilotAuthPlugin() {
                     headers: {
                       Accept: "application/json",
                       "Content-Type": "application/json",
-                      "User-Agent": "opencode-copilot-cli-auth/0.0.14",
+                      "User-Agent": "opencode-copilot-cli-auth/0.0.15",
                     },
                     body: JSON.stringify({
                       client_id: CLIENT_ID,
@@ -407,6 +404,16 @@ export async function CopilotAuthPlugin() {
           },
         },
       ],
+    },
+    "chat.params": async (input, output) => {
+      if (input.model.providerID !== "github-copilot") return;
+      if (input.model.api?.npm !== "@ai-sdk/github-copilot") return;
+      if (!input.model.id.includes("claude")) return;
+
+      const thinkingBudget = resolveClaudeThinkingBudget(input.model, input.message.variant);
+      if (thinkingBudget === undefined) return;
+
+      output.options.thinking_budget = thinkingBudget;
     },
   };
 }
