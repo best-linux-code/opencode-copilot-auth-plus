@@ -37,7 +37,7 @@ export async function CopilotAuthPlugin({ client }) {
   const fs = await import("node:fs");
   const os = await import("node:os");
   const path = await import("node:path");
-  const LOG_FILE = "/tmp/copilot-cli-auth.log";
+  const LOG_FILE = "/tmp/copilot-device-auth.log";
   const log = (msg) => {
     try {
       fs.appendFileSync(LOG_FILE, `[${new Date().toISOString()}] ${msg}\n`);

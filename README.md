@@ -14,7 +14,7 @@ This plugin is an enhanced OpenCode authentication provider for GitHub Copilot. 
 - Enhanced Token Exchange: Features a two-level fallback mechanism (v2/token to copilot_internal/user) to ensure reliable authentication.
 - Robust Device Flow: Implements the OAuth device code flow with proper handling for slow_down responses.
 - Automatic Cleanup: Removes stale provider configurations from opencode.json upon logout.
-- Debug Logging: Detailed response status and error body logging available at /tmp/copilot-cli-auth.log.
+- Debug Logging: Detailed response status and error body logging available at /tmp/copilot-device-auth.log.
 - Zero Cost: Provides access to all available Copilot models at no additional cost.
 - Future-Proof: Dynamically registers new models like claude-opus-4.6-1m if they are reported by the API.
 
@@ -74,7 +74,7 @@ npm 软件包: https://www.npmjs.com/package/@best-linux-code/opencode-copilot-d
 - 增强型令牌交换：具备两级回退机制（从 v2/token 回退到 copilot_internal/user），以确保身份验证的可靠性。
 - 稳健的设备流：实现 OAuth 设备代码流，并能妥善处理 slow_down 响应。
 - 自动清理：注销时自动从 opencode.json 中移除过时的提供程序配置。
-- 调试日志：在 /tmp/copilot-cli-auth.log 中提供详细的响应状态和错误主体日志。
+- 调试日志：在 /tmp/copilot-device-auth.log 中提供详细的响应状态和错误主体日志。
 - 零成本：免费访问所有可用的 Copilot 模型。
 - 面向未来：如果 API 报告了如 claude-opus-4.6-1m 等新模型，插件将动态注册这些模型。
 
