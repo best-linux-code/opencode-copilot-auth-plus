@@ -1,99 +1,117 @@
-# opencode-copilot-cli-auth
+# @best-linux-code/opencode-copilot-device-auth
 
-Package on npm: https://www.npmjs.com/package/@zhzy0077/opencode-copilot-cli-auth
+GitHub Repository: https://github.com/best-linux-code/opencode-copilot-device-auth
+Package on npm: https://www.npmjs.com/package/@best-linux-code/opencode-copilot-device-auth
 
-This fork replaces the older GitHub Copilot chat-auth flow with the newer Copilot CLI-style OAuth flow and makes `opencode` use the live Copilot model metadata for your account.
+This plugin is an enhanced OpenCode authentication provider for GitHub Copilot. It builds upon the official opencode-copilot-auth plugin, introducing major improvements in model metadata handling, authentication flow reliability, and support for advanced model features like Claude thinking budgets and Gemini reasoning efforts.
 
-## How to use
+## Features
 
-Add the plugin to your `opencode` config:
+- API-Driven Model Metadata: Fetches real-time model context limits directly from the Copilot API. For example, it correctly identifies the 200K context limit for Claude Opus 4.6 instead of falling back to a static 128K limit.
+- Dynamic Claude Thinking Budgets: Automatically generates low, medium, and high thinking_budget variants based on API-reported model capabilities.
+- Dynamic Gemini Reasoning Efforts: Automatically generates low, medium, and high reasoning_effort variants based on API-reported model capabilities.
+- Unified Headers: Implements consistent vscode-chat headers across all model families, including Claude, Gemini, GPT, and Grok.
+- Enhanced Token Exchange: Features a two-level fallback mechanism (v2/token to copilot_internal/user) to ensure reliable authentication.
+- Robust Device Flow: Implements the OAuth device code flow with proper handling for slow_down responses.
+- Automatic Cleanup: Removes stale provider configurations from opencode.json upon logout.
+- Debug Logging: Detailed response status and error body logging available at /tmp/copilot-cli-auth.log.
+- Zero Cost: Provides access to all available Copilot models at no additional cost.
+- Future-Proof: Dynamically registers new models like claude-opus-4.6-1m if they are reported by the API.
+
+## Model Limits Comparison
+
+This plugin patches live per-model limits from Copilot, ensuring OpenCode uses accurate context window sizes.
+
+| Model | This Plugin (Live) | static models.dev |
+| --- | --- | --- |
+| claude-opus-4.6 | 200,000 | 128,000 |
+| claude-sonnet-4.6 | 200,000 | 128,000 |
+| claude-haiku-4.5 | 144,000 | 128,000 |
+
+## Installation
+
+Install the package via npm:
+
+```bash
+npm install @best-linux-code/opencode-copilot-device-auth
+```
+
+Add the plugin to your opencode.json configuration:
 
 ```json
 {
-  "$schema": "https://opencode.ai/config.json",
   "plugin": [
-    "@zhzy0077/opencode-copilot-cli-auth@0.0.16"
+    "@best-linux-code/opencode-copilot-device-auth"
   ]
 }
 ```
 
-Then start `opencode` and log in to the `github-copilot` provider. The plugin handles the Copilot CLI-style device flow and will reuse the stored GitHub OAuth token afterward.
+## Known Limitations
 
-For local development before publishing, you can load the file directly:
-
-```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "plugin": [
-    "file:///absolute/path/to/index.mjs"
-  ]
-}
-```
-
-Important: if the file path contains `opencode-copilot-auth`, current `opencode` builds may skip loading it because of a hardcoded plugin-name filter. Use a path that does not contain that substring.
-
-## What changed in this fork
-
-- Auth flow: uses the Copilot CLI-style OAuth client flow and keeps the GitHub OAuth token directly.
-- Entitlement: fetches `/copilot_internal/user` and uses the entitlement-provided Copilot API base URL.
-- Token exchange: does not call `/copilot_internal/v2/token`.
-- Request profile: uses the newer `copilot-developer-cli` headers instead of the older chat profile.
-- Model metadata: fetches the live Copilot `/models` response during auth loading and patches the in-memory `opencode` provider model objects.
-
-## Context window and model limits
-
-The main practical difference from upstream is that this fork patches live per-model limits from Copilot instead of relying only on static metadata.
-
-That means `opencode` can see the Copilot-advertised values for:
-
-- `limit.context`
-- `limit.input`
-- `limit.output`
-
-As of March 10, 2026, the live GitHub Copilot `/models` response used by this
-fork exposes the Copilot CLI model profile. The table below compares the live
-Copilot CLI context window against the static `github-copilot` catalog on
-[`models.dev`](https://models.dev).
-
-| Model               | This Fork (CLI Context) | `models.dev` Context | Difference |
-| ------------------- | ----------------------: | -------------------: | ---------: |
-| `claude-opus-4.6`   |                 200,000 |              128,000 |    +72,000 |
-| `claude-sonnet-4.6` |                 200,000 |              128,000 |    +72,000 |
-| `claude-haiku-4.5`  |                 144,000 |              128,000 |    +16,000 |
-
-The practical takeaway is that this fork exposes larger live Claude context
-windows than the static `models.dev` values.
-
-Examples observed with this fork:
-
-- `claude-sonnet-4.6`
-  - context window: `200000`
-  - prompt/input limit: `168000`
-  - output limit: `32000`
-- `claude-opus-4.6`
-  - context window: `200000`
-  - prompt/input limit: `168000`
-  - output limit: `64000`
-- `claude-haiku-4.5`
-  - context window: `144000`
-  - prompt/input limit: `128000`
-  - output limit: `32000`
-
-Without this patching, `opencode` may show stale or smaller limits depending on the static model catalog it started from.
-
-## Claude thinking budget behavior
-
-This fork also changes Copilot Claude request behavior:
-
-- when the `thinking` variant is selected, it sends `thinking_budget: 16000`
-- when no variant is selected, it omits `thinking_budget` entirely
-
-This differs from upstream `opencode`, which currently sends `thinking_budget: 4000` for the built-in `thinking` variant.
-
-The plugin intentionally does not try to change the `opencode` core UI. So the visible Claude variant list is still controlled by `opencode` itself; this fork changes the request behavior, not the built-in variant picker labels.
+- Input Tokens Undefined: Some models (e.g., gpt-5, claude-opus-41) may display input=undefined because the Copilot API does not currently return max_prompt_tokens for these specific identifiers.
+- Grok Initiator Error: The grok-code-fast-1 model may occasionally return an "invalid initiator" error. This is a known issue with the upstream Copilot API and is not a bug within this plugin.
+- Duplicate Loader Calls: The internal CopilotAuthPlugin may still run alongside this plugin. This results in duplicate loader calls but is harmless and idempotent.
 
 ## Publishing
 
-```zsh
-./script/publish.ts
+Publishing is handled via GitHub Actions. You can manually trigger the workflow to release a new version (patch, minor, or major).
+
+---
+
+# @best-linux-code/opencode-copilot-device-auth (中文)
+
+GitHub 仓库: https://github.com/best-linux-code/opencode-copilot-device-auth
+npm 软件包: https://www.npmjs.com/package/@best-linux-code/opencode-copilot-device-auth
+
+本插件是针对 GitHub Copilot 的增强版 OpenCode 身份验证提供程序。它基于官方的 opencode-copilot-auth 插件构建，在模型元数据处理、身份验证流程可靠性以及对 Claude 思考预算 (thinking budget) 和 Gemini 推理强度 (reasoning effort) 等高级功能的支持方面进行了重大改进。
+
+## 功能特性
+
+- API 驱动的模型元数据：直接从 Copilot API 获取实时的模型上下文限制。例如，它能正确识别 Claude Opus 4.6 的 200K 上下文限制，而不是回退到静态的 128K 限制。
+- 动态 Claude 思考预算：根据 API 报告的模型能力，自动生成低、中、高三种思考预算 (thinking_budget) 变体。
+- 动态 Gemini 推理强度：根据 API 报告的模型能力，自动生成低、中、高三种推理强度 (reasoning_effort) 变体。
+- 统一请求头：在包括 Claude、Gemini、GPT 和 Grok 在内的所有模型系列中实现一致的 vscode-chat 请求头。
+- 增强型令牌交换：具备两级回退机制（从 v2/token 回退到 copilot_internal/user），以确保身份验证的可靠性。
+- 稳健的设备流：实现 OAuth 设备代码流，并能妥善处理 slow_down 响应。
+- 自动清理：注销时自动从 opencode.json 中移除过时的提供程序配置。
+- 调试日志：在 /tmp/copilot-cli-auth.log 中提供详细的响应状态和错误主体日志。
+- 零成本：免费访问所有可用的 Copilot 模型。
+- 面向未来：如果 API 报告了如 claude-opus-4.6-1m 等新模型，插件将动态注册这些模型。
+
+## 模型限制对比
+
+本插件会根据 Copilot 的实时数据修补每个模型的限制，确保 OpenCode 使用准确的上下文窗口大小。
+
+| 模型 | 本插件 (实时) | 静态 models.dev |
+| --- | --- | --- |
+| claude-opus-4.6 | 200,000 | 128,000 |
+| claude-sonnet-4.6 | 200,000 | 128,000 |
+| claude-haiku-4.5 | 144,000 | 128,000 |
+
+## 安装
+
+通过 npm 安装软件包：
+
+```bash
+npm install @best-linux-code/opencode-copilot-device-auth
 ```
+
+将插件添加到您的 opencode.json 配置中：
+
+```json
+{
+  "plugin": [
+    "@best-linux-code/opencode-copilot-device-auth"
+  ]
+}
+```
+
+## 已知限制
+
+- 输入令牌未定义：某些模型（例如 gpt-5、claude-opus-41）可能会显示 input=undefined，这是因为 Copilot API 目前未针对这些特定标识符返回 max_prompt_tokens。
+- Grok 启动器错误：grok-code-fast-1 模型可能会偶尔返回 "invalid initiator" 错误。这是上游 Copilot API 的已知问题，并非本插件的错误。
+- 重复加载调用：内置的 CopilotAuthPlugin 可能会与本插件同时运行。这会导致重复的加载调用，但由于操作是幂等的，因此并无大碍。
+
+## 发布
+
+发布工作由 GitHub Actions 处理。您可以手动触发工作流以发布新版本（修订号 patch、次版本号 minor 或主版本号 major）。
