@@ -1,11 +1,20 @@
 /**
- * @type {import("@opencode-ai/plugin").Plugin}
+ * OpenCode Copilot Auth Plugin
+ *
+ * Based on: https://github.com/anomalyco/opencode-copilot-auth
+ * Enhanced with: fetchModels, limit patching, Claude thinking variants,
+ *                claude-opus-4.6-1m registration, file logging.
+ *
+ * @type {import('@opencode-ai/plugin').Plugin}
  */
-export async function CopilotAuthPlugin() {
-  const CLIENT_ID = "Ov23ctDVkRmgkPke0Mmm";
-  const API_VERSION = "2025-05-01";
-  const OAUTH_POLLING_SAFETY_MARGIN_MS = 3000;
-  const OAUTH_SCOPES = "read:user read:org repo gist";
+export async function CopilotAuthPlugin({ client }) {
+  const CLIENT_ID = "Iv1.b507a08c87ecfe98";
+  const HEADERS = {
+    "User-Agent": "GitHubCopilotChat/0.35.0",
+    "Editor-Version": "vscode/1.107.0",
+    "Editor-Plugin-Version": "copilot-chat/0.35.0",
+    "Copilot-Integration-Id": "vscode-chat",
+  };
   const RESPONSES_API_ALTERNATE_INPUT_TYPES = [
     "file_search_call",
     "computer_call",
@@ -24,47 +33,118 @@ export async function CopilotAuthPlugin() {
     "reasoning",
   ];
 
+  // ── File logging (OpenCode doesn't capture plugin console output) ──
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const LOG_FILE = "/tmp/copilot-cli-auth.log";
+  const log = (msg) => {
+    try {
+      fs.appendFileSync(LOG_FILE, `[${new Date().toISOString()}] ${msg}\n`);
+    } catch {}
+  };
+
+  // ── Cleanup stale config when no auth ──
+  // Must run at plugin init (top-level), NOT inside loader,
+  // because provider.ts skips loader entirely when auth is absent.
+  try {
+    const configPath = path.join(os.homedir(), ".config", "opencode", "opencode.json");
+    const authPath = path.join(os.homedir(), ".local", "share", "opencode", "auth.json");
+    let hasAuth = false;
+    try {
+      const authData = JSON.parse(fs.readFileSync(authPath, "utf-8"));
+      hasAuth = !!(authData["github-copilot"]?.type === "oauth" && authData["github-copilot"]?.refresh);
+    } catch {}  // auth.json missing = no auth
+    if (!hasAuth) {
+      const config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+      if (config.provider?.["github-copilot"]) {
+        delete config.provider["github-copilot"];
+        if (config.provider && Object.keys(config.provider).length === 0) delete config.provider;
+        fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
+        log("Removed github-copilot config (no auth)");
+      }
+    }
+  } catch (e) {
+    log(`Config cleanup error: ${e.message}`);
+  }
+
+  // ── Helpers ──
+
   function normalizeDomain(url) {
     return url.replace(/^https?:\/\//, "").replace(/\/$/, "");
   }
 
   function getUrls(domain) {
-    const apiDomain = domain === "github.com" ? "api.github.com" : `api.${domain}`;
     return {
       DEVICE_CODE_URL: `https://${domain}/login/device/code`,
       ACCESS_TOKEN_URL: `https://${domain}/login/oauth/access_token`,
-      COPILOT_ENTITLEMENT_URL: `https://${apiDomain}/copilot_internal/user`,
+      TOKEN_URL_V2: `https://api.${domain}/copilot_internal/v2/token`,
+      TOKEN_URL_V1: `https://api.${domain}/copilot_internal/user`,
     };
   }
 
-  async function fetchEntitlement(info) {
-    const domain = info.enterpriseUrl ? normalizeDomain(info.enterpriseUrl) : "github.com";
+  // Fetch baseURL (endpoints.api) from entitlement API
+  // Try /v2/token first (also returns short-lived token), fallback to /copilot_internal/user
+  async function fetchBaseURL(refreshToken, domain) {
     const urls = getUrls(domain);
+    const authHeaders = {
+      Accept: "application/json",
+      ...HEADERS,
+    };
 
-    const response = await fetch(urls.COPILOT_ENTITLEMENT_URL, {
-      headers: {
-        Accept: "application/json",
-        Authorization: `Bearer ${info.refresh}`,
-        "User-Agent": "GithubCopilot/1.155.0",
-      },
-    });
-
-    if (!response.ok) {
-      throw new Error(`Entitlement fetch failed: ${response.status}`);
+    // Try /v2/token — returns token + endpoints
+    try {
+      const res = await fetch(urls.TOKEN_URL_V2, {
+        headers: { ...authHeaders, Authorization: `Bearer ${refreshToken}` },
+      });
+      if (res.ok) {
+        const d = await res.json();
+        if (d.endpoints?.api) {
+          log(`/v2/token OK, baseURL=${d.endpoints.api}${d.token ? ', has token' : ''}`);
+          return {
+            baseURL: d.endpoints.api,
+            token: d.token || null,
+            expires: d.expires_at ? d.expires_at * 1000 - 5 * 60 * 1000 : 0,
+          };
+        }
+      }
+    } catch (e) {
+      log(`/v2/token failed: ${e.message}`);
     }
 
-    return response.json();
+    // Fallback: /copilot_internal/user — returns endpoints (may not have token)
+    try {
+      const res = await fetch(urls.TOKEN_URL_V1, {
+        headers: { ...authHeaders, Authorization: `token ${refreshToken}` },
+      });
+      if (res.ok) {
+        const d = await res.json();
+        if (d.endpoints?.api) {
+          log(`/user OK, baseURL=${d.endpoints.api}${d.token ? ', has token' : ''}`);
+          return {
+            baseURL: d.endpoints.api,
+            token: d.token || null,
+            expires: d.expires_at ? d.expires_at * 1000 - 5 * 60 * 1000 : 0,
+          };
+        }
+      }
+    } catch (e) {
+      log(`/user fallback failed: ${e.message}`);
+    }
+
+    throw new Error("All token endpoints failed");
   }
 
-  async function fetchModels(info, baseURL) {
+  // ── Model fetching & patching ──
+
+  async function fetchModels(token, baseURL) {
     const response = await fetch(`${baseURL}/models`, {
       headers: {
-        Authorization: `Bearer ${info.refresh}`,
-        "Copilot-Integration-Id": "copilot-developer-cli",
-        "Openai-Intent": "model-access",
-        "User-Agent": "opencode-copilot-cli-auth/0.0.16",
-        "X-GitHub-Api-Version": API_VERSION,
-        "X-Interaction-Type": "model-access",
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+        ...HEADERS,
+        "Openai-Intent": "conversation-panel",
+        "X-GitHub-Api-Version": "2025-04-01",
         "X-Request-Id": crypto.randomUUID(),
       },
     });
@@ -80,55 +160,36 @@ export async function CopilotAuthPlugin() {
   function patchProviderModels(provider, liveModels) {
     if (!provider?.models) return;
 
-    const liveById = new Map(liveModels.map((model) => [model.id, model]));
+    const liveById = new Map(liveModels.map((m) => [m.id, m]));
+
+    // Register claude-opus-4.6-1m if API reports it but provider doesn't have it
     const opus4_6 = provider.models["claude-opus-4.6"];
     const opus4_6_1m = liveById.get("claude-opus-4.6-1m");
-
     if (opus4_6 && opus4_6_1m && !provider.models["claude-opus-4.6-1m"]) {
       const limits = opus4_6_1m.capabilities?.limits ?? {};
       const supports = opus4_6_1m.capabilities?.supports ?? {};
       const vision = !!supports.vision || !!limits.vision;
-
       provider.models["claude-opus-4.6-1m"] = {
         ...structuredClone(opus4_6),
         id: "claude-opus-4.6-1m",
-        api: {
-          ...opus4_6.api,
-          id: "claude-opus-4.6-1m",
-        },
+        api: { ...opus4_6.api, id: "claude-opus-4.6-1m" },
         name: "Claude Opus 4.6 (1M context)",
         family: opus4_6_1m.capabilities?.family ?? opus4_6.family,
-        cost: {
-          input: 0,
-          output: 0,
-          cache: {
-            read: 0,
-            write: 0,
-          },
-        },
+        cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
         limit: {
-          context:
-            limits.max_context_window_tokens
-            ?? opus4_6.limit.context,
-          input:
-            limits.max_prompt_tokens
-            ?? opus4_6.limit.input
-            ?? limits.max_context_window_tokens,
-          output:
-            limits.max_output_tokens
-            ?? limits.max_non_streaming_output_tokens
-            ?? opus4_6.limit.output,
+          context: limits.max_context_window_tokens ?? opus4_6.limit.context,
+          input: limits.max_prompt_tokens ?? opus4_6.limit.input ?? limits.max_context_window_tokens ?? opus4_6.limit.context,
+          output: limits.max_output_tokens ?? limits.max_non_streaming_output_tokens ?? opus4_6.limit.output ?? 32000,
         },
         capabilities: {
           ...structuredClone(opus4_6.capabilities),
           reasoning:
-            opus4_6.capabilities.reasoning
-            || !!supports.adaptive_thinking
-            || typeof supports.max_thinking_budget === "number"
-            || Array.isArray(supports.reasoning_effort),
+            opus4_6.capabilities.reasoning ||
+            !!supports.adaptive_thinking ||
+            typeof supports.max_thinking_budget === "number" ||
+            Array.isArray(supports.reasoning_effort),
           attachment: opus4_6.capabilities.attachment || vision,
-          toolcall:
-            opus4_6.capabilities.toolcall || !!supports.tool_calls,
+          toolcall: opus4_6.capabilities.toolcall || !!supports.tool_calls,
           input: {
             ...structuredClone(opus4_6.capabilities.input),
             image: opus4_6.capabilities.input.image || vision,
@@ -137,15 +198,9 @@ export async function CopilotAuthPlugin() {
       };
     }
 
+    // Patch all models: zero cost + live limits + capabilities
     for (const model of Object.values(provider.models)) {
-      model.cost = {
-        input: 0,
-        output: 0,
-        cache: {
-          read: 0,
-          write: 0,
-        },
-      };
+      model.cost = { input: 0, output: 0, cache: { read: 0, write: 0 } };
       model.api.npm = "@ai-sdk/github-copilot";
 
       const live = liveById.get(model.id);
@@ -155,148 +210,279 @@ export async function CopilotAuthPlugin() {
       const supports = live.capabilities?.supports ?? {};
       const vision = !!supports.vision || !!limits.vision;
 
-      model.limit.context =
-        limits.max_context_window_tokens
-        ?? model.limit.context;
-      model.limit.input =
-        limits.max_prompt_tokens
-        ?? model.limit.input
-        ?? limits.max_context_window_tokens;
-      model.limit.output =
-        limits.max_output_tokens
-        ?? limits.max_non_streaming_output_tokens
-        ?? model.limit.output;
+      model.limit.context = limits.max_context_window_tokens ?? model.limit.context;
+      model.limit.input = limits.max_prompt_tokens ?? model.limit.input ?? limits.max_context_window_tokens ?? model.limit.context;
+      model.limit.output = limits.max_output_tokens ?? limits.max_non_streaming_output_tokens ?? model.limit.output ?? 32000;
 
       model.capabilities.reasoning =
-        model.capabilities.reasoning
-        || !!supports.adaptive_thinking
-        || typeof supports.max_thinking_budget === "number"
-        || Array.isArray(supports.reasoning_effort);
+        model.capabilities.reasoning ||
+        !!supports.adaptive_thinking ||
+        typeof supports.max_thinking_budget === "number" ||
+        Array.isArray(supports.reasoning_effort);
       model.capabilities.attachment = model.capabilities.attachment || vision;
-      model.capabilities.toolcall =
-        model.capabilities.toolcall || !!supports.tool_calls;
-
+      model.capabilities.toolcall = model.capabilities.toolcall || !!supports.tool_calls;
       if (vision) {
         model.capabilities.input.image = true;
       }
-
     }
   }
 
-  function getConversationMetadata(init) {
-    try {
-      const body = typeof init?.body === "string" ? JSON.parse(init.body) : init?.body;
+  // Write variant configs to opencode.json for Claude and Gemini models only.
+  // Other models (GPT-5.x etc.) already get correct variants from transform.ts.
+  function writeVariantConfigs(provider, liveModels) {
+    const os = require("node:os");
+    const path = require("node:path");
+    const configPath = path.join(os.homedir(), ".config", "opencode", "opencode.json");
+    const config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
 
-      if (body?.messages) {
-        const lastMessage = body.messages[body.messages.length - 1];
-        return {
-          isVision: body.messages.some(
-            (message) =>
-              Array.isArray(message.content) &&
-              message.content.some((part) => part.type === "image_url"),
-          ),
-          isAgent:
-            lastMessage?.role &&
-            ["tool", "assistant"].includes(lastMessage.role),
-        };
+    const liveById = new Map(liveModels.map((m) => [m.id, m]));
+    const variantUpdates = {};
+
+    for (const model of Object.values(provider.models)) {
+      const live = liveById.get(model.id);
+      const supports = live?.capabilities?.supports;
+      if (!supports) continue;
+
+      const efforts = supports.reasoning_effort;
+      if (!Array.isArray(efforts) || efforts.length === 0) continue;
+
+      const isClaude = model.id.includes("claude");
+      const isGemini = model.id.includes("gemini");
+      if (!isClaude && !isGemini) continue;
+
+      const minBudget = supports.min_thinking_budget;
+      const maxBudget = supports.max_thinking_budget;
+
+      if (isClaude && typeof minBudget === "number" && typeof maxBudget === "number") {
+        const variants = { thinking: { disabled: true } };
+        for (let i = 0; i < efforts.length; i++) {
+          const ratio = efforts.length > 1 ? i / (efforts.length - 1) : 1;
+          const budget = Math.round(minBudget + ratio * (maxBudget - minBudget));
+          variants[efforts[i]] = { thinking_budget: budget };
+        }
+        variantUpdates[model.id] = variants;
+      } else if (isGemini) {
+        const variants = {};
+        for (const effort of efforts) {
+          variants[effort] = { reasoningEffort: effort };
+        }
+        variantUpdates[model.id] = variants;
       }
-
-      if (body?.input) {
-        const lastInput = body.input[body.input.length - 1];
-        const isAssistant = lastInput?.role === "assistant";
-        const hasAgentType = lastInput?.type
-          ? RESPONSES_API_ALTERNATE_INPUT_TYPES.includes(lastInput.type)
-          : false;
-
-        return {
-          isVision:
-            Array.isArray(lastInput?.content) &&
-            lastInput.content.some((part) => part.type === "input_image"),
-          isAgent: isAssistant || hasAgentType,
-        };
-      }
-    } catch {}
-
-    return {
-      isVision: false,
-      isAgent: false,
-    };
-  }
-
-  function buildHeaders(init, info, isVision, isAgent) {
-    const headers = {
-      ...(init?.headers ?? {}),
-      Authorization: `Bearer ${info.refresh}`,
-      "Copilot-Integration-Id": "copilot-developer-cli",
-      "Openai-Intent": "conversation-agent",
-      "User-Agent": "opencode-copilot-cli-auth/0.0.16",
-      "X-GitHub-Api-Version": API_VERSION,
-      "X-Initiator": isAgent ? "agent" : "user",
-      "X-Interaction-Id": crypto.randomUUID(),
-      "X-Interaction-Type": "conversation-agent",
-      "X-Request-Id": crypto.randomUUID(),
-    };
-
-    if (isVision) {
-      headers["Copilot-Vision-Request"] = "true";
     }
 
-    delete headers["x-api-key"];
-    delete headers["authorization"];
+    if (Object.keys(variantUpdates).length === 0) return;
 
-    return headers;
+    if (!config.provider) config.provider = {};
+    if (!config.provider["github-copilot"]) config.provider["github-copilot"] = {};
+    if (!config.provider["github-copilot"].models) config.provider["github-copilot"].models = {};
+    const cfgModels = config.provider["github-copilot"].models;
+
+    // Remove stale entries not in this update
+    for (const mid of Object.keys(cfgModels)) {
+      if (cfgModels[mid].variants && !variantUpdates[mid]) delete cfgModels[mid];
+    }
+    for (const [id, variants] of Object.entries(variantUpdates)) {
+      if (!cfgModels[id]) cfgModels[id] = {};
+      cfgModels[id].variants = variants;
+    }
+
+    fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
+    log(`Wrote variant configs: ${Object.keys(variantUpdates).join(", ")}`);
   }
 
   function resolveClaudeThinkingBudget(model, variant) {
     if (!model?.id?.includes("claude")) return undefined;
-    return variant === "thinking" ? 16000 : undefined;
+    return model.variants?.[variant]?.thinking_budget;
   }
+
+  // ── Plugin return ──
 
   return {
     auth: {
       provider: "github-copilot",
       loader: async (getAuth, provider) => {
-        const info = await getAuth();
+        let info = await getAuth();
         if (!info || info.type !== "oauth") return {};
 
-        let baseURL = info.baseUrl;
-        if (!baseURL) {
-          const entitlement = await fetchEntitlement(info);
-          baseURL = entitlement?.endpoints?.api;
-        }
-
-        if (baseURL) {
-          try {
-            const liveModels = await fetchModels(info, baseURL);
-            patchProviderModels(provider, liveModels);
-          } catch {}
-        } else {
+        if (provider) {
           patchProviderModels(provider, []);
         }
 
-        return {
-          ...(baseURL && { baseURL }),
-          apiKey: "",
-          async fetch(input, init) {
-            const auth = await getAuth();
-            if (!auth || auth.type !== "oauth") {
-              return fetch(input, init);
+        // Dynamically fetch baseURL from entitlement API (endpoints.api)
+        const domain = info.enterpriseUrl
+          ? normalizeDomain(info.enterpriseUrl)
+          : "github.com";
+        let baseURL;
+        try {
+          const result = await fetchBaseURL(info.refresh, domain);
+          baseURL = result.baseURL;
+
+          // If /v2/token returned a short-lived token, save it
+          if (result.token) {
+            const saveProviderID = info.enterpriseUrl
+              ? "github-copilot-enterprise"
+              : "github-copilot";
+            await client.auth.set({
+              path: { id: saveProviderID },
+              body: {
+                type: "oauth",
+                refresh: info.refresh,
+                access: result.token,
+                expires: result.expires,
+                ...(info.enterpriseUrl && { enterpriseUrl: info.enterpriseUrl }),
+              },
+            });
+            info.access = result.token;
+            info.expires = result.expires;
+          }
+        } catch (e) {
+          log(`fetchBaseURL failed: ${e.message}, using hardcoded baseURL`);
+          baseURL = info.enterpriseUrl
+            ? `https://copilot-api.${normalizeDomain(info.enterpriseUrl)}`
+            : "https://api.githubcopilot.com";
+        }
+
+        // Fetch live models and patch provider
+        if (provider) {
+          try {
+            const liveModels = await fetchModels(info.access || info.refresh, baseURL);
+            log(`Live models: ${liveModels.length} total`);
+            patchProviderModels(provider, liveModels);
+
+            // Log each model's limits and reasoning_effort
+            const liveById = new Map(liveModels.map((m) => [m.id, m]));
+            for (const model of Object.values(provider.models)) {
+              const live = liveById.get(model.id);
+              const supports = live?.capabilities?.supports;
+              const efforts = supports?.reasoning_effort;
+              log(
+                `  ${model.id}: context=${model.limit.context}, input=${model.limit.input}, output=${model.limit.output}` +
+                (efforts ? `, reasoning_effort=[${efforts}]` : "")
+              );
             }
 
-            const { isVision, isAgent } = getConversationMetadata(init);
-            const headers = buildHeaders(init, auth, isVision, isAgent);
+            try {
+              writeVariantConfigs(provider, liveModels);
+            } catch (e) {
+              log(`Failed to write variant config: ${e.message}`);
+            }
+          } catch (e) {
+            log(`fetchModels failed: ${e.message}`);
+          }
+        }
 
-            return fetch(input, {
+        return {
+          baseURL,
+          apiKey: "",
+          async fetch(input, init) {
+            let info = await getAuth();
+            if (info.type !== "oauth") return {};
+
+            // Token refresh: only when we have a real short-lived token with expiry
+            // (OAuth gho_* tokens don't expire, so expires=0 means skip refresh)
+            if (info.expires > 0 && info.expires < Date.now()) {
+              const domain = info.enterpriseUrl
+                ? normalizeDomain(info.enterpriseUrl)
+                : "github.com";
+              try {
+                const result = await fetchBaseURL(info.refresh, domain);
+                if (result.token) {
+                  const saveProviderID = info.enterpriseUrl
+                    ? "github-copilot-enterprise"
+                    : "github-copilot";
+                  await client.auth.set({
+                    path: { id: saveProviderID },
+                    body: {
+                      type: "oauth",
+                      refresh: info.refresh,
+                      access: result.token,
+                      expires: result.expires,
+                      ...(info.enterpriseUrl && { enterpriseUrl: info.enterpriseUrl }),
+                    },
+                  });
+                  info.access = result.token;
+                }
+              } catch (e) {
+                log(`Token refresh error: ${e.message}`);
+              }
+            }
+
+            // Detect conversation metadata for headers
+            let isAgentCall = false;
+            let isVisionRequest = false;
+            try {
+              const body =
+                typeof init.body === "string"
+                  ? JSON.parse(init.body)
+                  : init.body;
+
+              if (body?.messages) {
+                if (body.messages.length > 0) {
+                  const lastMessage = body.messages[body.messages.length - 1];
+                  isAgentCall =
+                    lastMessage.role &&
+                    ["tool", "assistant"].includes(lastMessage.role);
+                }
+                isVisionRequest = body.messages.some(
+                  (msg) =>
+                    Array.isArray(msg.content) &&
+                    msg.content.some((part) => part.type === "image_url"),
+                );
+              }
+
+              if (body?.input) {
+                const lastInput = body.input[body.input.length - 1];
+                const isAssistant = lastInput?.role === "assistant";
+                const hasAgentType = lastInput?.type
+                  ? RESPONSES_API_ALTERNATE_INPUT_TYPES.includes(lastInput.type)
+                  : false;
+                isAgentCall = isAssistant || hasAgentType;
+                isVisionRequest =
+                  Array.isArray(lastInput?.content) &&
+                  lastInput.content.some((part) => part.type === "input_image");
+              }
+            } catch (e) {
+              log(`Body parse error: ${e.message}`);
+            }
+
+            const headers = {
+              ...init.headers,
+              ...HEADERS,
+              Authorization: `Bearer ${info.access || info.refresh}`,
+              "Openai-Intent": "conversation-edits",
+              "x-initiator": isAgentCall ? "agent" : "user",
+            };
+            if (isVisionRequest) {
+              headers["Copilot-Vision-Request"] = "true";
+            }
+
+            delete headers["x-api-key"];
+            delete headers["authorization"];
+
+            const url = typeof input === "string" ? input : input?.url ?? String(input);
+            log(`fetch → ${url.replace(/\/\/[^/]+/, "//***")}`);
+
+            const resp = await fetch(input, {
               ...init,
               headers,
             });
+            if (!resp.ok) {
+              const cloned = resp.clone();
+              try {
+                const errBody = await cloned.text();
+                log(`fetch ← ${resp.status} ${resp.statusText} ${url.replace(/\/\/[^/]+/, "//***")} body=${errBody.slice(0, 300)}`);
+              } catch (_) {}
+            } else {
+              log(`fetch ← ${resp.status} ${url.replace(/\/\/[^/]+/, "//***")}`);
+            }
+            return resp;
           },
         };
       },
       methods: [
         {
           type: "oauth",
-          label: "Login with GitHub Copilot CLI",
+          label: "Login with GitHub Copilot",
           prompts: [
             {
               type: "select",
@@ -327,9 +513,8 @@ export async function CopilotAuthPlugin() {
                   const url = value.includes("://")
                     ? new URL(value)
                     : new URL(`https://${value}`);
-                  if (!url.hostname) {
+                  if (!url.hostname)
                     return "Please enter a valid URL or domain";
-                  }
                   return undefined;
                 } catch {
                   return "Please enter a valid URL (e.g., company.ghe.com or https://company.ghe.com)";
@@ -344,7 +529,8 @@ export async function CopilotAuthPlugin() {
             let actualProvider = "github-copilot";
 
             if (deploymentType === "enterprise") {
-              domain = normalizeDomain(inputs.enterpriseUrl);
+              const enterpriseUrl = inputs.enterpriseUrl;
+              domain = normalizeDomain(enterpriseUrl);
               actualProvider = "github-copilot-enterprise";
             }
 
@@ -355,11 +541,11 @@ export async function CopilotAuthPlugin() {
               headers: {
                 Accept: "application/json",
                 "Content-Type": "application/json",
-                "User-Agent": "opencode-copilot-cli-auth/0.0.16",
+                ...HEADERS,
               },
               body: JSON.stringify({
                 client_id: CLIENT_ID,
-                scope: OAUTH_SCOPES,
+                scope: "read:user",
               }),
             });
 
@@ -380,7 +566,7 @@ export async function CopilotAuthPlugin() {
                     headers: {
                       Accept: "application/json",
                       "Content-Type": "application/json",
-                      "User-Agent": "opencode-copilot-cli-auth/0.0.16",
+                      ...HEADERS,
                     },
                     body: JSON.stringify({
                       client_id: CLIENT_ID,
@@ -395,20 +581,37 @@ export async function CopilotAuthPlugin() {
                   const data = await response.json();
 
                   if (data.access_token) {
-                    const entitlement = await fetchEntitlement({
-                      refresh: data.access_token,
-                      enterpriseUrl:
-                        actualProvider === "github-copilot-enterprise"
-                          ? domain
-                          : undefined,
-                    });
+                    // Immediately fetch baseURL and save with real access token
+                    let baseUrl;
+                    try {
+                      const result = await fetchBaseURL(data.access_token, domain);
+                      baseUrl = result.baseURL;
+                      // If /v2/token returned a short-lived token, use it as access
+                      if (result.token) {
+                        const tokenResult = {
+                          type: "success",
+                          refresh: data.access_token,
+                          access: result.token,
+                          expires: result.expires,
+                          baseUrl,
+                        };
+                        if (actualProvider === "github-copilot-enterprise") {
+                          tokenResult.provider = "github-copilot-enterprise";
+                          tokenResult.enterpriseUrl = domain;
+                        }
+                        return tokenResult;
+                      }
+                    } catch (e) {
+                      log(`Post-login fetchBaseURL failed: ${e.message}`);
+                    }
 
+                    // Fallback: save access_token as both refresh and access
                     const result = {
                       type: "success",
                       refresh: data.access_token,
                       access: data.access_token,
                       expires: 0,
-                      baseUrl: entitlement?.endpoints?.api,
+                      ...(baseUrl && { baseUrl }),
                     };
 
                     if (actualProvider === "github-copilot-enterprise") {
@@ -421,25 +624,17 @@ export async function CopilotAuthPlugin() {
 
                   if (data.error === "authorization_pending") {
                     await new Promise((resolve) =>
-                      setTimeout(
-                        resolve,
-                        deviceData.interval * 1000
-                          + OAUTH_POLLING_SAFETY_MARGIN_MS,
-                      ),
+                      setTimeout(resolve, deviceData.interval * 1000),
                     );
                     continue;
                   }
 
+                  // Handle slow_down: GitHub asks us to increase polling interval
                   if (data.error === "slow_down") {
-                    const nextInterval =
-                      (typeof data.interval === "number" && data.interval > 0 ?
-                        data.interval
-                      : deviceData.interval + 5) * 1000;
+                    deviceData.interval = (deviceData.interval || 5) + 5;
+                    log(`OAuth polling slow_down, interval now ${deviceData.interval}s`);
                     await new Promise((resolve) =>
-                      setTimeout(
-                        resolve,
-                        nextInterval + OAUTH_POLLING_SAFETY_MARGIN_MS,
-                      ),
+                      setTimeout(resolve, deviceData.interval * 1000),
                     );
                     continue;
                   }
@@ -447,12 +642,9 @@ export async function CopilotAuthPlugin() {
                   if (data.error) return { type: "failed" };
 
                   await new Promise((resolve) =>
-                    setTimeout(
-                      resolve,
-                      deviceData.interval * 1000
-                        + OAUTH_POLLING_SAFETY_MARGIN_MS,
-                    ),
+                    setTimeout(resolve, deviceData.interval * 1000),
                   );
+                  continue;
                 }
               },
             };
