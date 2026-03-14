@@ -486,7 +486,8 @@ export async function CopilotAuthPlugin({ client }) {
                   const data = await cloned.json();
                   const u = data.usage;
                   if (u) {
-                    log(`usage model=${data.model || bodyModel} prompt=${u.prompt_tokens} completion=${u.completion_tokens} total=${u.total_tokens}`);
+                    const cd = u.prompt_tokens_details || {};
+                    log(`usage model=${data.model || bodyModel} total=${u.total_tokens} input=${u.prompt_tokens} output=${u.completion_tokens} cache_read=${cd.cached_tokens ?? 0} cache_write=${u.prompt_tokens - (cd.cached_tokens ?? 0)}`);
                   } else {
                     log(`fetch ← ${resp.status} model=${bodyModel} ${url.replace(/\/\/[^/]+/, "//***")}`);
                   }
@@ -523,7 +524,8 @@ export async function CopilotAuthPlugin({ client }) {
                             const parsed = JSON.parse(payload);
                             if (parsed.usage) {
                               const u = parsed.usage;
-                              log(`usage model=${parsed.model || bodyModel} prompt=${u.prompt_tokens} completion=${u.completion_tokens} total=${u.total_tokens}`);
+                              const cd = u.prompt_tokens_details || {};
+                              log(`usage model=${parsed.model || bodyModel} total=${u.total_tokens} input=${u.prompt_tokens} output=${u.completion_tokens} cache_read=${cd.cached_tokens ?? 0} cache_write=${u.prompt_tokens - (cd.cached_tokens ?? 0)}`);
                               usageLogged = true;
                             }
                           } catch (_) {}
