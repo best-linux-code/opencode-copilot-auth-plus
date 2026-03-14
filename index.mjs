@@ -211,8 +211,10 @@ export async function CopilotAuthPlugin({ client }) {
       const vision = !!supports.vision || !!limits.vision;
 
       model.limit.context = limits.max_context_window_tokens ?? model.limit.context;
-      model.limit.input = limits.max_prompt_tokens ?? model.limit.input ?? limits.max_context_window_tokens ?? model.limit.context;
       model.limit.output = limits.max_output_tokens ?? limits.max_non_streaming_output_tokens ?? model.limit.output ?? 32000;
+      // input must use max_prompt_tokens (server-enforced), NOT max_context_window_tokens
+      // fallback: context - output (safe estimate when max_prompt_tokens is missing)
+      model.limit.input = limits.max_prompt_tokens ?? model.limit.input ?? (model.limit.context - model.limit.output);
 
       model.capabilities.reasoning =
         model.capabilities.reasoning ||
@@ -460,7 +462,8 @@ export async function CopilotAuthPlugin({ client }) {
             delete headers["authorization"];
 
             const url = typeof input === "string" ? input : input?.url ?? String(input);
-            log(`fetch → ${url.replace(/\/\/[^/]+/, "//***")}`);
+            const bodyModel = parsedBody?.model ?? "unknown";
+            log(`fetch → ${url.replace(/\/\/[^/]+/, "//***")} model=${bodyModel}`);
 
             const resp = await fetch(input, {
               ...init,
@@ -470,10 +473,10 @@ export async function CopilotAuthPlugin({ client }) {
               const cloned = resp.clone();
               try {
                 const errBody = await cloned.text();
-                log(`fetch ← ${resp.status} ${resp.statusText} ${url.replace(/\/\/[^/]+/, "//***")} body=${errBody.slice(0, 300)}`);
+                log(`fetch ← ${resp.status} ${resp.statusText} model=${bodyModel} ${url.replace(/\/\/[^/]+/, "//***")} body=${errBody.slice(0, 300)}`);
               } catch (_) {}
             } else {
-              log(`fetch ← ${resp.status} ${url.replace(/\/\/[^/]+/, "//***")}`);
+              log(`fetch ← ${resp.status} model=${bodyModel} ${url.replace(/\/\/[^/]+/, "//***")}`);
             }
             return resp;
           },
