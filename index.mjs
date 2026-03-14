@@ -495,7 +495,7 @@ export async function CopilotAuthPlugin({ client }) {
                   if (u) {
                     const cd = u.prompt_tokens_details || {};
                     const lim = MODEL_LIMITS.get(data.model || bodyModel);
-                    const rate = lim ? ` usage_rate=${((u.prompt_tokens / lim.input) * 100).toFixed(1)}%` : "";
+                    const rate = lim ? ` usage_rate=${Math.round((u.total_tokens / lim.context) * 100)}%` : "";
                     log(`usage session=${sid} model=${data.model || bodyModel} total=${u.total_tokens} input=${u.prompt_tokens} output=${u.completion_tokens} cache_read=${cd.cached_tokens ?? 0} cache_write=${u.prompt_tokens - (cd.cached_tokens ?? 0)}${rate}`);
                   } else {
                     log(`fetch ← ${resp.status} model=${bodyModel} ${url.replace(/\/\/[^/]+/, "//***")}`);
@@ -535,7 +535,7 @@ export async function CopilotAuthPlugin({ client }) {
                               const u = parsed.usage;
                               const cd = u.prompt_tokens_details || {};
                               const lim = MODEL_LIMITS.get(parsed.model || bodyModel);
-                              const rate = lim ? ` usage_rate=${((u.prompt_tokens / lim.input) * 100).toFixed(1)}%` : "";
+                              const rate = lim ? ` usage_rate=${Math.round((u.total_tokens / lim.context) * 100)}%` : "";
                               log(`usage session=${sid} model=${parsed.model || bodyModel} total=${u.total_tokens} input=${u.prompt_tokens} output=${u.completion_tokens} cache_read=${cd.cached_tokens ?? 0} cache_write=${u.prompt_tokens - (cd.cached_tokens ?? 0)}${rate}`);
                               usageLogged = true;
                             }
