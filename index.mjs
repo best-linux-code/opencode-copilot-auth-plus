@@ -453,8 +453,8 @@ export async function CopilotAuthPlugin({ client }) {
             }
 
             // Extract session ID from OpenCode headers
-            const hdrs = init?.headers || {};
-            const sessionId = hdrs["x-opencode-session"] || hdrs["X-Opencode-Session"] || "";
+            const rawHdrs = init?.headers;
+            const sessionId = (rawHdrs?.get ? rawHdrs.get("x-opencode-session") : rawHdrs?.["x-opencode-session"]) || "";
             const sid = sessionId ? sessionId.slice(0, 16) : "none";
 
             const headers = {
