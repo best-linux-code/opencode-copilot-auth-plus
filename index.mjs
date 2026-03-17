@@ -45,6 +45,72 @@ export async function CopilotAuthPlugin({ client }) {
   };
   const MODEL_LIMITS = new Map(); // model_id -> { input, context, output }
 
+  function header(h, key) {
+    if (!h) return "";
+    if (typeof h.get === "function") return h.get(key) || "";
+    if (Array.isArray(h)) {
+      const pair = h.find(([k]) => String(k).toLowerCase() === key.toLowerCase());
+      return pair?.[1] || "";
+    }
+    return h[key] || h[key.toLowerCase()] || "";
+  }
+
+  function usage(data, bodyModel) {
+    const resp = data?.response;
+    const root = resp && typeof resp === "object" ? resp : data;
+    const u = root?.usage;
+    if (!u) return;
+
+    const input = u.prompt_tokens ?? u.input_tokens;
+    const output = u.completion_tokens ?? u.output_tokens;
+    const total =
+      u.total_tokens ??
+      (typeof input === "number" && typeof output === "number" ? input + output : undefined);
+    const prompt = u.prompt_tokens_details ?? u.input_tokens_details ?? {};
+    const cached = prompt.cached_tokens ?? 0;
+
+    return {
+      model: root?.model || data?.model || bodyModel,
+      input,
+      output,
+      total,
+      cacheRead: cached,
+      cacheWrite: typeof input === "number" ? Math.max(input - cached, 0) : undefined,
+    };
+  }
+
+  function logUsage(data, sid, bodyModel) {
+    const info = usage(data, bodyModel);
+    if (!info) return false;
+
+    const lim = MODEL_LIMITS.get(info.model || bodyModel);
+    const rate = lim && typeof info.total === "number"
+      ? ` usage_rate=${Math.round((info.total / lim.context) * 100)}%`
+      : "";
+    log(
+      `usage session=${sid} model=${info.model || bodyModel} total=${info.total ?? "unknown"} input=${info.input ?? "unknown"} output=${info.output ?? "unknown"} cache_read=${info.cacheRead} cache_write=${info.cacheWrite ?? "unknown"}${rate}`,
+    );
+    return true;
+  }
+
+  function scan(buf, sid, bodyModel) {
+    const lines = buf.split(/\r?\n/);
+    const rest = lines.pop() || "";
+
+    for (const line of lines) {
+      if (!line.startsWith("data: ")) continue;
+      const payload = line.slice(6).trim();
+      if (!payload || payload === "[DONE]") continue;
+      try {
+        if (logUsage(JSON.parse(payload), sid, bodyModel)) {
+          return { rest, hit: true };
+        }
+      } catch {}
+    }
+
+    return { rest, hit: false };
+  }
+
   // ── Cleanup stale config when no auth ──
   // Must run at plugin init (top-level), NOT inside loader,
   // because provider.ts skips loader entirely when auth is absent.
@@ -454,7 +520,7 @@ export async function CopilotAuthPlugin({ client }) {
 
             // Extract session ID from OpenCode headers
             const rawHdrs = init?.headers;
-            const sessionId = (rawHdrs?.get ? rawHdrs.get("x-opencode-session") : rawHdrs?.["x-opencode-session"]) || "";
+            const sessionId = header(rawHdrs, "x-opencode-session");
             const sid = sessionId ? sessionId.slice(0, 16) : "none";
 
             const headers = {
@@ -491,13 +557,7 @@ export async function CopilotAuthPlugin({ client }) {
                 try {
                   const cloned = resp.clone();
                   const data = await cloned.json();
-                  const u = data.usage;
-                  if (u) {
-                    const cd = u.prompt_tokens_details || {};
-                    const lim = MODEL_LIMITS.get(data.model || bodyModel);
-                    const rate = lim ? ` usage_rate=${Math.round((u.total_tokens / lim.context) * 100)}%` : "";
-                    log(`usage session=${sid} model=${data.model || bodyModel} total=${u.total_tokens} input=${u.prompt_tokens} output=${u.completion_tokens} cache_read=${cd.cached_tokens ?? 0} cache_write=${u.prompt_tokens - (cd.cached_tokens ?? 0)}${rate}`);
-                  } else {
+                  if (!logUsage(data, sid, bodyModel)) {
                     log(`fetch ← ${resp.status} session=${sid} model=${bodyModel} ${url.replace(/\/\/[^/]+/, "//***")}`);
                   }
                 } catch (_) {
@@ -516,31 +576,29 @@ export async function CopilotAuthPlugin({ client }) {
                 const writer = writable.getWriter();
                 const decoder = new TextDecoder();
                 let usageLogged = false;
+                let buf = "";
                 (async () => {
                   try {
                     while (true) {
                       const { done, value } = await reader.read();
-                      if (done) { await writer.close(); break; }
-                      await writer.write(value);
-                      const text = decoder.decode(value, { stream: true });
-                      if (!usageLogged && text.includes('"usage"')) {
-                        const lines = text.split('\n');
-                        for (const line of lines) {
-                          if (!line.startsWith('data: ')) continue;
-                          const payload = line.slice(6).trim();
-                          if (payload === '[DONE]') continue;
-                          try {
-                            const parsed = JSON.parse(payload);
-                            if (parsed.usage) {
-                              const u = parsed.usage;
-                              const cd = u.prompt_tokens_details || {};
-                              const lim = MODEL_LIMITS.get(parsed.model || bodyModel);
-                              const rate = lim ? ` usage_rate=${Math.round((u.total_tokens / lim.context) * 100)}%` : "";
-                              log(`usage session=${sid} model=${parsed.model || bodyModel} total=${u.total_tokens} input=${u.prompt_tokens} output=${u.completion_tokens} cache_read=${cd.cached_tokens ?? 0} cache_write=${u.prompt_tokens - (cd.cached_tokens ?? 0)}${rate}`);
-                              usageLogged = true;
-                            }
-                          } catch (_) {}
+                      if (done) {
+                        buf += decoder.decode();
+                        if (!usageLogged) {
+                          const parsed = scan(buf, sid, bodyModel);
+                          usageLogged = parsed.hit;
                         }
+                        if (!usageLogged) {
+                          log(`fetch ← ${resp.status} session=${sid} model=${bodyModel} ${url.replace(/\/\/[^/]+/, "//***")}`);
+                        }
+                        await writer.close();
+                        break;
+                      }
+                      await writer.write(value);
+                      if (!usageLogged) {
+                        buf += decoder.decode(value, { stream: true });
+                        const parsed = scan(buf, sid, bodyModel);
+                        buf = parsed.rest;
+                        usageLogged = parsed.hit;
                       }
                     }
                   } catch (e) { try { await writer.abort(e); } catch(_){} }
